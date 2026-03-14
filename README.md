@@ -99,7 +99,8 @@ Add to your IDE's MCP config:
 | `tmux_safe_execute` | 🛡️ Run command with connection safety checks |
 | `tmux_connection_guard` | 🔍 Check SSH connection status |
 | `tmux_remote_parallel` | 🚀 Run parallel tasks in remote tmux |
-| `tmux_check_remote_tasks` | 📊 Monitor parallel task status |
+| `tmux_check_remote_tasks` | 📊 Monitor parallel task status with exit codes & duration |
+| `tmux_kill_remote_tasks` | 🗑️ Stop individual tasks or kill entire remote session |
 | `tmux_register_server` | Tag servers for natural language matching |
 | `tmux_find_server` | Find server by natural language query |
 | `tmux_health_check` | Quick shell responsiveness check |
@@ -131,12 +132,111 @@ The `tmux_safe_execute` and `tmux_connection_guard` tools prevent dangerous miso
 
 ### 🚀 Remote Parallel Execution
 
-Run multiple commands in parallel on remote hosts, surviving SSH disconnections:
+Run multiple long-running commands in parallel on remote hosts. Tasks are **disconnect-resilient** — they continue running even if your SSH connection drops.
+
+#### How It Works
 
 ```
-tmux_remote_parallel    → creates remote tmux session with parallel windows
-tmux_check_remote_tasks → monitor progress anytime
+┌─────────────────────────────────────────────────────────────┐
+│                    Your Machine (Local)                      │
+│                                                             │
+│  ┌──────────────┐         ┌──────────────────────┐          │
+│  │  tmux pane    │ ◄─────► │  AI Agent (MCP)      │          │
+│  │  SSH session  │         │  mcp_server.py       │          │
+│  └──────┬───────┘         └──────────────────────┘          │
+└─────────┼───────────────────────────────────────────────────┘
+          │ SSH (can disconnect!)
+    ┌─────▼───────────────────────────────────────────────┐
+    │               Remote Host                           │
+    │                                                     │
+    │   tmux session "ai_work"    ← survives disconnect   │
+    │   ┌──────────┐ ┌──────────┐ ┌──────────┐           │
+    │   │ window 0  │ │ window 1  │ │ window 2  │         │
+    │   │ "build"   │ │ "test"    │ │ "deploy"  │         │
+    │   │ make build│ │ make test │ │ ./deploy  │         │
+    │   └──────────┘ └──────────┘ └──────────┘           │
+    │                                                     │
+    │   /tmp/_tmux_tasks_ai_work/   ← status tracking     │
+    │   ├── build.status   (start time, exit code, etc.)  │
+    │   ├── test.status                                   │
+    │   └── deploy.status                                 │
+    └─────────────────────────────────────────────────────┘
 ```
+
+#### Complete Workflow
+
+**Step 1: Launch parallel tasks**
+
+Ask the AI Agent:
+> "Run `make build`, `make test`, and `tail -f /var/log/app.log` in parallel on the remote server"
+
+This calls `tmux_remote_parallel` which:
+- Creates a tmux session on the **remote** host (not local)
+- Each command runs in its own window with status tracking
+- Records start time, and will record exit code + duration on completion
+
+**Step 2: Monitor progress**
+
+Ask the AI Agent:
+> "Check how the remote tasks are going"
+
+This calls `tmux_check_remote_tasks` which returns:
+```
+📊 Remote Tasks Status (session: ai_work):
+
+  ✅ [build] completed (exit code: 0) in 2m34s
+      Build successful: 142 targets built
+  🔄 [test] running (1m12s elapsed)
+      Running test suite: 87/120 passed...
+  🔄 [logs] running (3m45s elapsed)
+      [2024-01-15 10:23:45] INFO: Request processed in 12ms
+```
+
+**Step 3: Stop or clean up**
+
+> "Stop the log tailing task" → `tmux_kill_remote_tasks(window_name='logs')`
+> "Clean up all remote tasks" → `tmux_kill_remote_tasks()` (kills entire session)
+
+#### Use Cases
+
+| Scenario | Commands |
+|----------|----------|
+| **Build & Test** | `['make build', 'make test', 'make lint']` |
+| **Log Monitoring** | `['tail -f /var/log/app.log', 'tail -f /var/log/error.log']` |
+| **Data Processing** | `['python process_batch_1.py', 'python process_batch_2.py']` |
+| **Deployment** | `['docker build -t app .', 'npm run build', 'python manage.py migrate']` |
+| **System Diagnostics** | `['vmstat 1', 'iostat -x 1', 'tail -f /var/log/syslog']` |
+
+#### Advanced: Custom Window Names
+
+```
+tmux_remote_parallel(
+    commands=['make build', 'pytest -v', 'flake8 .'],
+    window_names=['build', 'test', 'lint'],
+    session_name='ci_pipeline'
+)
+```
+
+#### Advanced: Reuse Existing Session
+
+Add tasks to an already-running session without killing previous tasks:
+
+```
+tmux_remote_parallel(
+    commands=['tail -f /var/log/nginx/access.log'],
+    window_names=['nginx_logs'],
+    session_name='ai_work',
+    reuse_session=True
+)
+```
+
+#### SSH Disconnection Recovery
+
+If your SSH connection drops mid-task:
+1. Tasks continue running in the remote tmux session
+2. Reconnect SSH manually (or have AI send SSH command via `tmux_send_keys`)
+3. Check task status with `tmux_check_remote_tasks` — it reads status files
+4. Or attach interactively: `tmux attach -t ai_work`
 
 ### 🎯 Smart Target Resolution
 

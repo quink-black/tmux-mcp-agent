@@ -101,7 +101,8 @@ python3 tmux_agent.py -t work:0.0 run "hostname"  # 执行命令
 | `tmux_safe_execute` | 🛡️ 带连接安全检查的命令执行 |
 | `tmux_connection_guard` | 🔍 检测 SSH 连接状态 |
 | `tmux_remote_parallel` | 🚀 在远程 tmux 中并行执行任务 |
-| `tmux_check_remote_tasks` | 📊 监控并行任务状态 |
+| `tmux_check_remote_tasks` | 📊 监控并行任务状态（含退出码和时长） |
+| `tmux_kill_remote_tasks` | 🗑️ 终止单个任务或整个远程 session |
 | `tmux_register_server` | 为服务器添加标签，支持自然语言匹配 |
 | `tmux_find_server` | 通过自然语言查找服务器 |
 | `tmux_health_check` | 快速检查 shell 响应 |
@@ -133,12 +134,115 @@ python3 tmux_agent.py -t work:0.0 run "hostname"  # 执行命令
 
 ### 🚀 远程并行执行
 
-在远程主机上并行执行多个命令，SSH 断连后任务继续运行：
+在远程主机上并行执行多个耗时命令，**断连不丢失** — 即使 SSH 连接中断，任务仍在后台继续运行。
+
+#### 工作原理
 
 ```
-tmux_remote_parallel    → 在远程创建 tmux session 并行执行
-tmux_check_remote_tasks → 随时检查任务进度
+┌─────────────────────────────────────────────────────────────┐
+│                    你的机器（本地）                            │
+│                                                             │
+│  ┌──────────────┐         ┌──────────────────────┐          │
+│  │  tmux pane    │ ◄─────► │  AI Agent (MCP)      │          │
+│  │  SSH 连接     │         │  mcp_server.py       │          │
+│  └──────┬───────┘         └──────────────────────┘          │
+└─────────┼───────────────────────────────────────────────────┘
+          │ SSH（可以断开！）
+    ┌─────▼───────────────────────────────────────────────┐
+    │                  远程主机                             │
+    │                                                     │
+    │   tmux session "ai_work"    ← SSH 断连后继续运行      │
+    │   ┌──────────┐ ┌──────────┐ ┌──────────┐           │
+    │   │ window 0  │ │ window 1  │ │ window 2  │         │
+    │   │ "build"   │ │ "test"    │ │ "deploy"  │         │
+    │   │ make build│ │ make test │ │ ./deploy  │         │
+    │   └──────────┘ └──────────┘ └──────────┘           │
+    │                                                     │
+    │   /tmp/_tmux_tasks_ai_work/    ← 状态追踪文件         │
+    │   ├── build.status   (启动时间、退出码、耗时等)        │
+    │   ├── test.status                                   │
+    │   └── deploy.status                                 │
+    └─────────────────────────────────────────────────────┘
 ```
+
+**关键设计**：AI Agent 通过本地 tmux pane 向远程主机发送 `tmux new-session` 命令，在**远程主机内部**创建一个独立的 tmux session。每个任务在独立的 window 中运行，并被包装了状态追踪（记录启动时间、退出码、耗时）。即使本地 SSH 断开，远程 tmux session 依然存活。
+
+#### 完整工作流
+
+**第 1 步：启动并行任务**
+
+告诉 AI Agent：
+> "在远程服务器上并行运行 `make build`、`make test` 和 `tail -f /var/log/app.log`"
+
+AI 调用 `tmux_remote_parallel`，它会：
+- 在远程主机上创建 tmux session（不是本地的）
+- 每个命令在独立 window 中运行，带状态追踪
+- 自动记录启动时间，命令完成后记录退出码和耗时
+
+**第 2 步：查看进度**
+
+告诉 AI Agent：
+> "看看远程任务跑得怎么样了"
+
+AI 调用 `tmux_check_remote_tasks`，返回：
+```
+📊 Remote Tasks Status (session: ai_work):
+
+  ✅ [build] completed (exit code: 0) in 2m34s
+      Build successful: 142 targets built
+  🔄 [test] running (1m12s elapsed)
+      Running test suite: 87/120 passed...
+  🔄 [logs] running (3m45s elapsed)
+      [2024-01-15 10:23:45] INFO: Request processed in 12ms
+```
+
+**第 3 步：终止或清理**
+
+> "停止日志跟踪任务" → `tmux_kill_remote_tasks(window_name='logs')`
+> "清理所有远程任务" → `tmux_kill_remote_tasks()`（终止整个 session）
+
+#### 使用场景
+
+| 场景 | 命令示例 |
+|------|---------|
+| **编译 & 测试** | `['make build', 'make test', 'make lint']` |
+| **日志监控** | `['tail -f /var/log/app.log', 'tail -f /var/log/error.log']` |
+| **数据处理** | `['python process_batch_1.py', 'python process_batch_2.py']` |
+| **部署流水线** | `['docker build -t app .', 'npm run build', 'python manage.py migrate']` |
+| **系统诊断** | `['vmstat 1', 'iostat -x 1', 'tail -f /var/log/syslog']` |
+
+#### 进阶：自定义窗口名称
+
+```
+tmux_remote_parallel(
+    commands=['make build', 'pytest -v', 'flake8 .'],
+    window_names=['build', 'test', 'lint'],
+    session_name='ci_pipeline'
+)
+```
+
+给每个窗口起有意义的名字，在 `tmux_check_remote_tasks` 输出中更容易识别。
+
+#### 进阶：复用已有 Session
+
+向已在运行的 session 中追加任务，不会终止之前的任务：
+
+```
+tmux_remote_parallel(
+    commands=['tail -f /var/log/nginx/access.log'],
+    window_names=['nginx_logs'],
+    session_name='ai_work',
+    reuse_session=True
+)
+```
+
+#### SSH 断连恢复
+
+如果任务执行过程中 SSH 连接断开：
+1. 远程 tmux session 中的任务继续运行，不受影响
+2. 手动重新连接 SSH（或让 AI 通过 `tmux_send_keys` 发送 SSH 命令）
+3. 用 `tmux_check_remote_tasks` 查看任务状态 — 它读取状态追踪文件
+4. 或手动交互查看：`tmux attach -t ai_work`
 
 ### 🎯 智能目标定位
 

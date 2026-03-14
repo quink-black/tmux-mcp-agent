@@ -832,6 +832,8 @@ class TmuxAgent:
         self,
         session_name: str = "ai_work",
         commands: Optional[list[str]] = None,
+        window_names: Optional[list[str]] = None,
+        reuse_session: bool = False,
         timeout: float = 10.0,
     ) -> dict:
         """Run multiple tasks in parallel inside tmux on the remote host.
@@ -839,95 +841,173 @@ class TmuxAgent:
         Creates a tmux session on the remote host with each command in its own window.
         Tasks survive SSH disconnection; reconnect to resume viewing.
 
+        Each command is wrapped with a timing/status tracker that records:
+        - Start time
+        - End time and duration
+        - Exit code
+        - A completion marker file for reliable status checking
+
         Args:
             session_name: remote tmux session name.
             commands: list of commands to run in parallel, each in a separate window.
+            window_names: optional list of human-readable names for each window.
+                          If shorter than commands, remaining windows use 'task_N'.
+            reuse_session: if True, append new windows to an existing session instead
+                          of killing and recreating it.
             timeout: timeout per operation step.
 
         Returns:
             {
                 "success": bool,
                 "session_name": str,
-                "windows": list[{"index": int, "command": str}],
-                "instructions": str,  # follow-up instructions
+                "windows": list[{"index": int, "name": str, "command": str}],
+                "reused": bool,
+                "instructions": str,
             }
         """
         result = {
             "success": False,
             "session_name": session_name,
             "windows": [],
+            "reused": False,
             "instructions": "",
         }
+
+        if not commands:
+            result["instructions"] = "No commands provided."
+            return result
+
+        # Normalize window names
+        names = list(window_names or [])
+        for i in range(len(names), len(commands)):
+            names.append(f"task_{i}")
 
         # Check remote tmux status first
         tmux_info = self.detect_remote_tmux(timeout=timeout)
         if not tmux_info["has_tmux"]:
-            result["instructions"] = "tmux not installed on remote host. Install it first: sudo apt/yum install -y tmux"
+            result["instructions"] = (
+                "tmux not installed on remote host. Install it first:\n"
+                "  Ubuntu/Debian: sudo apt install -y tmux\n"
+                "  CentOS/RHEL:   sudo yum install -y tmux\n"
+                "  macOS:         brew install tmux"
+            )
             return result
 
-        # Kill existing session with the same name
-        if session_name in tmux_info["sessions"]:
+        session_exists = session_name in tmux_info["sessions"]
+
+        if session_exists and reuse_session:
+            # Reuse existing session: just add new windows
+            result["reused"] = True
+        elif session_exists:
+            # Kill and recreate
             self.run_command(f"tmux kill-session -t {shlex.quote(session_name)} 2>/dev/null", max_wait=3)
             time.sleep(0.3)
+            session_exists = False
 
-        # Create new session (detached, won't affect current shell)
-        # Use -n to name the first window directly, avoiding base-index issues
-        first_window = "task_0" if commands else "default"
-        create_output = self.run_command(
-            f"tmux new-session -d -s {shlex.quote(session_name)} -n {shlex.quote(first_window)}",
-            max_wait=timeout
-        )
-        if "error" in create_output.lower() and "duplicate" not in create_output.lower():
-            result["instructions"] = f"Failed to create remote tmux session: {create_output}"
-            return result
+        # Create status directory on remote host
+        status_dir = f"/tmp/_tmux_tasks_{session_name}"
+        self.run_command(f"mkdir -p {shlex.quote(status_dir)}", max_wait=3)
+
+        if not session_exists:
+            # Create new session (detached, won't affect current shell)
+            first_window = shlex.quote(names[0])
+            create_output = self.run_command(
+                f"tmux new-session -d -s {shlex.quote(session_name)} -n {first_window}",
+                max_wait=timeout
+            )
+            if "error" in create_output.lower() and "duplicate" not in create_output.lower():
+                result["instructions"] = f"Failed to create remote tmux session: {create_output}"
+                return result
 
         result["success"] = True
 
         # Execute commands in separate windows
-        if commands:
-            for i, cmd in enumerate(commands):
-                window_name = f"task_{i}"
-                if i == 0:
-                    # First command uses the window named via new-session -n
-                    self.run_command(
-                        f"tmux send-keys -t {shlex.quote(session_name)}:{shlex.quote(window_name)} {shlex.quote(cmd)} C-m",
-                        max_wait=3
-                    )
-                else:
-                    # Subsequent commands create new windows
-                    self.run_command(
-                        f"tmux new-window -t {shlex.quote(session_name)} -n {shlex.quote(window_name)}",
-                        max_wait=3
-                    )
-                    self.run_command(
-                        f"tmux send-keys -t {shlex.quote(session_name)}:{shlex.quote(window_name)} {shlex.quote(cmd)} C-m",
-                        max_wait=3
-                    )
-                result["windows"].append({"index": i, "name": window_name, "command": cmd})
-                time.sleep(0.2)
+        for i, cmd in enumerate(commands):
+            wname = names[i]
+            safe_wname = shlex.quote(wname)
+            safe_session = shlex.quote(session_name)
 
+            # Wrap command with timing/status tracking
+            # Records: start time, exit code, end time, duration
+            status_file = f"{status_dir}/{wname}.status"
+            wrapped_cmd = (
+                f'echo "STARTED $(date +%s)" > {status_file}; '
+                f'_start_ts=$(date +%s); '
+                f'{cmd}; '
+                f'_exit_code=$?; '
+                f'_end_ts=$(date +%s); '
+                f'_duration=$((_end_ts - _start_ts)); '
+                f'echo "FINISHED $_exit_code $_duration $(date +%s)" >> {status_file}'
+            )
+
+            need_create_window = True
+            if not session_exists and i == 0:
+                # First command uses the window created with new-session
+                need_create_window = False
+            elif session_exists and reuse_session and i == 0:
+                # When reusing, always create new windows for all commands
+                need_create_window = True
+
+            if need_create_window:
+                self.run_command(
+                    f"tmux new-window -t {safe_session} -n {safe_wname}",
+                    max_wait=3
+                )
+
+            self.run_command(
+                f"tmux send-keys -t {safe_session}:{safe_wname} {shlex.quote(wrapped_cmd)} C-m",
+                max_wait=3
+            )
+            result["windows"].append({"index": i, "name": wname, "command": cmd})
+            time.sleep(0.2)
+
+        action = "reused" if result["reused"] else "created"
         result["instructions"] = (
-            f"Remote tmux session '{session_name}' created.\n"
-            f"{len(result['windows'])} tasks running in parallel.\n"
-            f"How to check:\n"
-            f"  - tmux_run_command: 'tmux capture-pane -t {session_name}:task_N -p' to view task output\n"
-            f"  - tmux_run_command: 'tmux ls' to check session status\n"
-            f"  - After reconnection: 'tmux attach -t {session_name}' to resume\n"
-            f"  - When done: 'tmux kill-session -t {session_name}' to clean up"
+            f"Remote tmux session '{session_name}' {action}.\n"
+            f"{len(result['windows'])} tasks running in parallel.\n\n"
+            f"How to monitor:\n"
+            f"  - tmux_check_remote_tasks: get status, exit codes, and duration of all tasks\n"
+            f"  - tmux_run_command: 'tmux capture-pane -t {session_name}:<window_name> -p' for live output\n"
+            f"  - tmux_run_command: 'tmux ls' to check session status\n\n"
+            f"After SSH reconnection:\n"
+            f"  - 'tmux attach -t {session_name}' to view interactively\n\n"
+            f"Cleanup:\n"
+            f"  - tmux_kill_remote_tasks to stop all tasks and clean up\n"
+            f"  - Or: tmux_run_command 'tmux kill-session -t {session_name}'"
         )
         return result
 
     def check_remote_tmux_tasks(
         self,
         session_name: str = "ai_work",
+        window_filter: Optional[str] = None,
+        capture_lines: int = 10,
         timeout: float = 10.0,
     ) -> dict:
         """Check the status of tasks in a remote tmux session.
 
+        Uses status files (written by setup_remote_tmux wrapper) for accurate
+        tracking of exit codes, start/end times, and durations.
+        Falls back to prompt detection when status files are unavailable.
+
+        Args:
+            session_name: remote tmux session name to check.
+            window_filter: if provided, only check this specific window name.
+            capture_lines: number of tail lines to capture per task (default 10).
+            timeout: timeout per operation step.
+
         Returns:
             {
                 "session_exists": bool,
-                "tasks": list[{"window": str, "output_tail": str, "is_running": bool}],
+                "tasks": list[{
+                    "window": str,
+                    "output_tail": str,
+                    "is_running": bool,
+                    "exit_code": int | None,
+                    "duration_seconds": int | None,
+                    "started_at": int | None,      # unix timestamp
+                    "finished_at": int | None,      # unix timestamp
+                }],
             }
         """
         result = {"session_exists": False, "tasks": []}
@@ -952,9 +1032,21 @@ class TmuxAgent:
             if name.strip() and not name.strip().startswith(("📊", "⚠", "⏱"))
         ]
 
+        # Filter to specific window if requested
+        if window_filter:
+            window_names = [w for w in window_names if w == window_filter]
+
+        # Read all status files in batch for efficiency
+        status_dir = f"/tmp/_tmux_tasks_{session_name}"
+        status_raw = self.run_command(
+            f"cat {shlex.quote(status_dir)}/*.status 2>/dev/null; echo __STATUS_END__",
+            max_wait=5
+        )
+        # Parse status files into a dict keyed by window name
+        status_map = self._parse_task_status_files(status_raw, window_names, status_dir)
+
         for win_name in window_names:
-            # Use window name for capture-pane (avoids base-index issues)
-            # No pipe to tail; fetch all content and truncate in Python
+            # Capture pane output
             full_output = self.run_command(
                 f"tmux capture-pane -t {shlex.quote(session_name)}:{shlex.quote(win_name)} -p",
                 max_wait=5
@@ -967,27 +1059,164 @@ class TmuxAgent:
                     continue
                 clean_lines.append(line)
 
-            # Take last 10 lines as tail
-            tail_lines = clean_lines[-10:] if clean_lines else []
+            # Take last N lines as tail
+            tail_lines = clean_lines[-capture_lines:] if clean_lines else []
             tail_text = "\n".join(tail_lines)
 
-            # Determine if still running (check if last non-empty line is a shell prompt)
-            is_running = True
-            last_nonempty = ""
-            for line in reversed(clean_lines):
-                if line.strip():
-                    last_nonempty = line.strip()
-                    break
-            for pattern in self.DEFAULT_PROMPT_PATTERNS:
-                if re.search(pattern, last_nonempty):
-                    is_running = False
-                    break
+            # Check status from status file first
+            status_info = status_map.get(win_name, {})
+            is_running = status_info.get("is_running", None)
+            exit_code = status_info.get("exit_code", None)
+            duration = status_info.get("duration_seconds", None)
+            started_at = status_info.get("started_at", None)
+            finished_at = status_info.get("finished_at", None)
+
+            # Fallback: determine if running from prompt detection
+            if is_running is None:
+                is_running = True
+                last_nonempty = ""
+                for line in reversed(clean_lines):
+                    if line.strip():
+                        last_nonempty = line.strip()
+                        break
+                for pattern in self.DEFAULT_PROMPT_PATTERNS:
+                    if re.search(pattern, last_nonempty):
+                        is_running = False
+                        break
+
+            # Calculate elapsed time for running tasks
+            if is_running and started_at:
+                # Get current time on remote
+                now_output = self.run_command("date +%s", max_wait=3)
+                try:
+                    now_ts = int(re.search(r"(\d{10,})", now_output).group(1))
+                    duration = now_ts - started_at
+                except (AttributeError, ValueError):
+                    pass
 
             result["tasks"].append({
                 "window": win_name,
                 "output_tail": tail_text[-500:] if tail_text else "",
                 "is_running": is_running,
+                "exit_code": exit_code,
+                "duration_seconds": duration,
+                "started_at": started_at,
+                "finished_at": finished_at,
             })
+
+        return result
+
+    def _parse_task_status_files(
+        self,
+        raw_output: str,
+        window_names: list[str],
+        status_dir: str,
+    ) -> dict:
+        """Parse batch-read status files into a structured dict.
+
+        Status file format (per window):
+            STARTED <unix_timestamp>
+            FINISHED <exit_code> <duration_seconds> <unix_timestamp>
+
+        Returns:
+            dict keyed by window name with status info.
+        """
+        status_map = {}
+
+        # Read individual status files for each window
+        for wname in window_names:
+            status_file = f"{status_dir}/{wname}.status"
+            content = self.run_command(
+                f"cat {shlex.quote(status_file)} 2>/dev/null || echo __NO_STATUS__",
+                max_wait=3
+            )
+
+            if "__NO_STATUS__" in content:
+                continue
+
+            info = {"is_running": True, "exit_code": None, "duration_seconds": None,
+                    "started_at": None, "finished_at": None}
+
+            for line in content.strip().split("\n"):
+                line = line.strip()
+                # STARTED <timestamp>
+                m = re.match(r"STARTED\s+(\d+)", line)
+                if m:
+                    info["started_at"] = int(m.group(1))
+                    continue
+                # FINISHED <exit_code> <duration> <timestamp>
+                m = re.match(r"FINISHED\s+(\d+)\s+(\d+)\s+(\d+)", line)
+                if m:
+                    info["exit_code"] = int(m.group(1))
+                    info["duration_seconds"] = int(m.group(2))
+                    info["finished_at"] = int(m.group(3))
+                    info["is_running"] = False
+                    continue
+
+            status_map[wname] = info
+
+        return status_map
+
+    def kill_remote_tmux_tasks(
+        self,
+        session_name: str = "ai_work",
+        window_name: Optional[str] = None,
+        timeout: float = 5.0,
+    ) -> dict:
+        """Kill remote tmux tasks — either a specific window or the entire session.
+
+        Also cleans up the status directory.
+
+        Args:
+            session_name: remote tmux session name.
+            window_name: specific window to kill. If None, kills the entire session.
+            timeout: timeout per operation step.
+
+        Returns:
+            {
+                "success": bool,
+                "killed": str,       # what was killed (session or window name)
+                "message": str,
+            }
+        """
+        result = {"success": False, "killed": "", "message": ""}
+
+        # Check if session exists
+        check = self.run_command(
+            f"tmux has-session -t {shlex.quote(session_name)} 2>/dev/null && echo __EXISTS__ || echo __NOT_EXISTS__",
+            max_wait=5
+        )
+        if "__NOT_EXISTS__" in check:
+            result["message"] = f"Session '{session_name}' does not exist on remote host."
+            return result
+
+        if window_name:
+            # Kill specific window
+            kill_output = self.run_command(
+                f"tmux kill-window -t {shlex.quote(session_name)}:{shlex.quote(window_name)} 2>&1; echo $?",
+                max_wait=timeout
+            )
+            if "0" in kill_output.strip().split("\n")[-1:]:
+                result["success"] = True
+                result["killed"] = f"{session_name}:{window_name}"
+                result["message"] = f"Window '{window_name}' killed in session '{session_name}'."
+                # Clean up status file for this window
+                status_file = f"/tmp/_tmux_tasks_{session_name}/{window_name}.status"
+                self.run_command(f"rm -f {shlex.quote(status_file)}", max_wait=3)
+            else:
+                result["message"] = f"Failed to kill window '{window_name}': {kill_output}"
+        else:
+            # Kill entire session
+            kill_output = self.run_command(
+                f"tmux kill-session -t {shlex.quote(session_name)} 2>&1; echo $?",
+                max_wait=timeout
+            )
+            result["success"] = True
+            result["killed"] = session_name
+            result["message"] = f"Session '{session_name}' and all its tasks killed."
+            # Clean up status directory
+            status_dir = f"/tmp/_tmux_tasks_{session_name}"
+            self.run_command(f"rm -rf {shlex.quote(status_dir)}", max_wait=3)
 
         return result
 

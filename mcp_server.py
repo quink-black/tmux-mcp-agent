@@ -630,12 +630,18 @@ async def list_tools() -> list[Tool]:
                 "\n\n🔑 Key benefits:"
                 "\n  - Commands survive SSH disconnection (remote tmux keeps running)"
                 "\n  - True parallel execution (not sequential)"
+                "\n  - Tracks exit code, duration, and start/end time per task"
                 "\n  - Can check task status anytime via tmux_check_remote_tasks"
+                "\n  - Can kill individual tasks or all via tmux_kill_remote_tasks"
                 "\n  - Reconnect and resume after network interruption"
                 "\n\n⚠️ Prerequisites:"
                 "\n  - The target pane must be SSH'd into a remote host"
                 "\n  - Remote host must have tmux installed"
-                "\n\n📝 Example: Run build + test + deploy in parallel on remote server"
+                "\n\n📝 Example workflow:"
+                "\n  1. tmux_remote_parallel(commands=['make build', 'make test', 'tail -f app.log'])"
+                "\n  2. tmux_check_remote_tasks() → see progress, exit codes, durations"
+                "\n  3. tmux_kill_remote_tasks(window_name='task_2') → stop log tailing"
+                "\n  4. tmux_kill_remote_tasks() → clean up everything when done"
             ),
             inputSchema={
                 "type": "object",
@@ -653,13 +659,31 @@ async def list_tools() -> list[Tool]:
                         "items": {"type": "string"},
                         "description": (
                             "List of shell commands to run in parallel. "
-                            "Each command gets its own tmux window on the remote host."
+                            "Each command gets its own tmux window on the remote host. "
+                            "Commands are wrapped with timing/status tracking automatically."
+                        ),
+                    },
+                    "window_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional human-readable names for each window (e.g. ['build', 'test', 'logs']). "
+                            "If fewer names than commands, remaining use 'task_N'. "
+                            "Names are used in tmux_check_remote_tasks output."
                         ),
                     },
                     "session_name": {
                         "type": "string",
                         "description": "Name for the remote tmux session. Default: 'ai_work'.",
                         "default": "ai_work",
+                    },
+                    "reuse_session": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, append new windows to an existing session instead of "
+                            "killing and recreating it. Useful for adding tasks incrementally. Default: false."
+                        ),
+                        "default": False,
                     },
                 },
                 "required": ["commands"],
@@ -670,7 +694,12 @@ async def list_tools() -> list[Tool]:
             description=(
                 "📊 CHECK REMOTE TASKS: Check the status of parallel tasks running in a "
                 "remote tmux session (created by tmux_remote_parallel). "
-                "Shows each task's latest output and whether it's still running."
+                "Shows each task's latest output, exit code, duration, and whether it's still running."
+                "\n\n📈 Status information per task:"
+                "\n  - Running / Completed status"
+                "\n  - Exit code (0 = success, non-zero = error)"
+                "\n  - Duration in seconds (elapsed for running tasks, total for completed)"
+                "\n  - Last N lines of output"
             ),
             inputSchema={
                 "type": "object",
@@ -687,6 +716,52 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Remote tmux session name to check. Default: 'ai_work'.",
                         "default": "ai_work",
+                    },
+                    "window_filter": {
+                        "type": "string",
+                        "description": "Check only this specific window/task name. If omitted, checks all tasks.",
+                    },
+                    "capture_lines": {
+                        "type": "integer",
+                        "description": "Number of output tail lines to capture per task. Default: 10.",
+                        "default": 10,
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="tmux_kill_remote_tasks",
+            description=(
+                "🗑️ KILL REMOTE TASKS: Stop and clean up remote parallel tasks. "
+                "Can kill a specific task (window) or the entire session."
+                "\n\n💡 Usage:"
+                "\n  - Kill one task: tmux_kill_remote_tasks(window_name='build')"
+                "\n  - Kill all tasks: tmux_kill_remote_tasks() — kills entire session + cleans up status files"
+                "\n\n⚠️ This is destructive — killed tasks cannot be resumed."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Tmux pane target connected to the remote host. Required.",
+                    },
+                    "server_hint": {
+                        "type": "string",
+                        "description": "Natural language hint to auto-detect target.",
+                    },
+                    "session_name": {
+                        "type": "string",
+                        "description": "Remote tmux session name. Default: 'ai_work'.",
+                        "default": "ai_work",
+                    },
+                    "window_name": {
+                        "type": "string",
+                        "description": (
+                            "Specific task/window name to kill (e.g. 'build', 'task_0'). "
+                            "If omitted, kills the entire session and all tasks."
+                        ),
                     },
                 },
                 "required": [],
@@ -869,6 +944,9 @@ async def _dispatch_tool(name: str, args: dict[str, Any]) -> str:
 
     elif name == "tmux_check_remote_tasks":
         return await _check_remote_tasks(args)
+
+    elif name == "tmux_kill_remote_tasks":
+        return await _kill_remote_tasks(args)
 
     else:
         return f"Unknown tool: {name}"
@@ -1317,6 +1395,8 @@ async def _remote_parallel(args: dict[str, Any]) -> str:
     """Create a tmux session on the remote host and run multiple tasks in parallel."""
     commands = args.get("commands", [])
     session_name = args.get("session_name", "ai_work")
+    window_names = args.get("window_names")
+    reuse_session = args.get("reuse_session", False)
 
     if not commands:
         return "❌ 'commands' list is empty. Provide at least one command."
@@ -1356,14 +1436,17 @@ async def _remote_parallel(args: dict[str, Any]) -> str:
             None, lambda: ctrl.setup_remote_tmux(
                 session_name=session_name,
                 commands=commands,
+                window_names=window_names,
+                reuse_session=reuse_session,
             )
         )
 
         if not result["success"]:
             return f"❌ Failed to setup remote tmux: {result['instructions']}"
 
+        action = "Appended to existing" if result.get("reused") else "Started"
         lines = [
-            f"🚀 Remote parallel execution started on {guard['hostname']}!",
+            f"🚀 Remote parallel execution — {action} session on {guard['hostname']}!",
             f"   Session: {result['session_name']}",
             f"   Tasks: {len(result['windows'])}",
             "",
@@ -1373,6 +1456,7 @@ async def _remote_parallel(args: dict[str, Any]) -> str:
 
         lines.append(f"\n{result['instructions']}")
         lines.append(f"\n💡 Use tmux_check_remote_tasks to monitor progress.")
+        lines.append(f"   Use tmux_kill_remote_tasks to stop tasks when done.")
 
         return "\n".join(lines)
 
@@ -1380,6 +1464,8 @@ async def _remote_parallel(args: dict[str, Any]) -> str:
 async def _check_remote_tasks(args: dict[str, Any]) -> str:
     """Check the status of tasks in a remote tmux session."""
     session_name = args.get("session_name", "ai_work")
+    window_filter = args.get("window_filter")
+    capture_lines = args.get("capture_lines", 10)
 
     # Resolve target
     target = _resolve_target(args)
@@ -1394,7 +1480,11 @@ async def _check_remote_tasks(args: dict[str, Any]) -> str:
         ctrl = _make_controller(target)
 
         result = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: ctrl.check_remote_tmux_tasks(session_name=session_name)
+            None, lambda: ctrl.check_remote_tmux_tasks(
+                session_name=session_name,
+                window_filter=window_filter,
+                capture_lines=capture_lines,
+            )
         )
 
         if not result["session_exists"]:
@@ -1408,12 +1498,32 @@ async def _check_remote_tasks(args: dict[str, Any]) -> str:
 
         all_done = True
         for task in result["tasks"]:
-            status_icon = "🔄" if task["is_running"] else "✅"
-            if task["is_running"]:
+            is_running = task["is_running"]
+            exit_code = task.get("exit_code")
+            duration = task.get("duration_seconds")
+
+            if is_running:
                 all_done = False
-            lines.append(f"  {status_icon} [{task['window']}] {'running...' if task['is_running'] else 'completed'}")
+                status_icon = "🔄"
+                status_text = "running"
+                if duration is not None:
+                    status_text += f" ({_format_duration(duration)} elapsed)"
+            else:
+                if exit_code == 0:
+                    status_icon = "✅"
+                    status_text = "completed"
+                elif exit_code is not None:
+                    status_icon = "❌"
+                    status_text = f"failed (exit code: {exit_code})"
+                else:
+                    status_icon = "✅"
+                    status_text = "completed"
+                if duration is not None:
+                    status_text += f" in {_format_duration(duration)}"
+
+            lines.append(f"  {status_icon} [{task['window']}] {status_text}")
             if task["output_tail"]:
-                # Show only last 3 lines
+                # Show tail lines indented
                 tail_lines = task["output_tail"].strip().split("\n")[-3:]
                 for tl in tail_lines:
                     lines.append(f"      {tl}")
@@ -1421,11 +1531,55 @@ async def _check_remote_tasks(args: dict[str, Any]) -> str:
         lines.append("")
         if all_done:
             lines.append("🎉 All tasks completed!")
-            lines.append(f"   Clean up: tmux_run_command 'tmux kill-session -t {session_name}'")
+            lines.append(f"   Use tmux_kill_remote_tasks to clean up.")
         else:
             lines.append("⏳ Some tasks still running. Check again later.")
+            lines.append(f"   Use tmux_kill_remote_tasks(window_name='...') to stop individual tasks.")
 
         return "\n".join(lines)
+
+
+async def _kill_remote_tasks(args: dict[str, Any]) -> str:
+    """Kill remote tmux tasks — specific window or entire session."""
+    session_name = args.get("session_name", "ai_work")
+    window_name = args.get("window_name")
+
+    # Resolve target
+    target = _resolve_target(args)
+    if not target:
+        return (
+            "❌ Cannot determine target pane. Please provide 'target' or 'server_hint'.\n"
+            "Run tmux_list_all_panes first to find available targets."
+        )
+
+    lock = _get_target_lock(target)
+    async with lock:
+        ctrl = _make_controller(target)
+
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: ctrl.kill_remote_tmux_tasks(
+                session_name=session_name,
+                window_name=window_name,
+            )
+        )
+
+        if result["success"]:
+            return f"✅ {result['message']}"
+        else:
+            return f"❌ {result['message']}"
+
+
+def _format_duration(seconds: int) -> str:
+    """Format duration in seconds to human-readable string."""
+    if seconds < 60:
+        return f"{seconds}s"
+    elif seconds < 3600:
+        m, s = divmod(seconds, 60)
+        return f"{m}m{s}s"
+    else:
+        h, remainder = divmod(seconds, 3600)
+        m, s = divmod(remainder, 60)
+        return f"{h}h{m}m{s}s"
 
 
 if __name__ == "__main__":
