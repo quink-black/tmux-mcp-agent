@@ -38,7 +38,7 @@
 ### 1. 安装配置
 
 ```bash
-git clone https://github.com/your-username/tmux-mcp-agent.git
+git clone https://github.com/quink-black/tmux-mcp-agent.git
 cd tmux-mcp-agent
 bash setup.sh
 ```
