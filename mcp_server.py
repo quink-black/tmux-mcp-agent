@@ -273,6 +273,9 @@ async def list_tools() -> list[Tool]:
                 "Uses unique marker + temp file to reliably detect command completion. "
                 "Returns structured result with stdout, exit_code, timed_out, and duration. "
                 "Concurrency-safe: commands to the same pane are serialized automatically. "
+                "\n\n⏱️ Timeout behavior: If the command does not finish within max_wait, "
+                "returns a task_id. Use tmux_wait_for_command(task_id) to continue waiting "
+                "without re-sending the command. This avoids repeated polling loops."
                 "\n\n🎯 Target resolution (in priority order):"
                 "\n  1. Explicit 'target' param → used directly"
                 "\n  2. 'server_hint' → matches against registry + pane titles"
@@ -312,10 +315,55 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="tmux_wait_for_command",
+            description=(
+                "⏳ WAIT FOR COMMAND: Continue waiting for a previously timed-out command to complete. "
+                "When tmux_run_command times out, it returns a task_id. Use this tool with that "
+                "task_id to resume waiting — no command is re-sent, it just watches for the "
+                "original completion marker."
+                "\n\n🔑 Key benefits:"
+                "\n  - Decouples 'send command' from 'wait for completion'"
+                "\n  - Each call returns within max_wait seconds (no infinite blocking)"
+                "\n  - Can be called repeatedly until the command finishes"
+                "\n  - Returns full output and exit code once complete"
+                "\n\n📝 Typical workflow:"
+                "\n  1. tmux_run_command('make build', max_wait=30) → times out, returns task_id"
+                "\n  2. tmux_wait_for_command(task_id, max_wait=60) → still running or completed"
+                "\n  3. If still running, call again or use tmux_capture_pane to check progress"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "The task_id returned by a timed-out tmux_run_command.",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": (
+                            "Tmux pane target (e.g. 'myserver:1.1'). "
+                            "Must be the same pane where the original command was sent."
+                        ),
+                    },
+                    "server_hint": {
+                        "type": "string",
+                        "description": "Natural language hint to auto-detect target.",
+                    },
+                    "max_wait": {
+                        "type": "number",
+                        "description": "Max seconds to wait for completion. Default: 300 (5 min).",
+                        "default": 300,
+                    },
+                },
+                "required": ["task_id"],
+            },
+        ),
+        Tool(
             name="tmux_capture_pane",
             description=(
                 "Capture and return the current visible content of the tmux pane. "
                 "Useful for reading output that's already on screen without sending a new command."
+                "\n\n💡 To wait for a long-running command to finish, use tmux_wait_for_command instead."
             ),
             inputSchema={
                 "type": "object",
@@ -829,6 +877,34 @@ async def _dispatch_tool(name: str, args: dict[str, Any]) -> str:
             # Run in thread pool (run_command has blocking time.sleep calls)
             output = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: ctrl.run_command(command, max_wait=max_wait)
+            )
+            return output
+
+    elif name == "tmux_wait_for_command":
+        task_id = args["task_id"]
+        max_wait = args.get("max_wait", 300)
+
+        # Resolve target (needed to create controller for the correct pane)
+        target = _resolve_target(args)
+
+        # If no explicit target, try to get it from the pending task info
+        if not target:
+            from tmux_agent import _pending_tasks
+            task_info = _pending_tasks.get(task_id)
+            if task_info:
+                target = task_info["target"]
+
+        if not target:
+            return (
+                "❌ Cannot determine target pane. Please provide 'target' or 'server_hint'.\n"
+                "The original pane where the command was sent is needed."
+            )
+
+        lock = _get_target_lock(target)
+        async with lock:
+            ctrl = _make_controller(target)
+            output = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: ctrl.wait_for_command(task_id, max_wait=max_wait)
             )
             return output
 

@@ -19,6 +19,12 @@ import shlex
 import uuid
 from typing import Optional
 
+# Module-level storage for pending (timed-out) tasks.
+# Keyed by task_id (uid), stores marker/file info so wait_for_command can resume.
+# This must be module-level because mcp_server.py creates new TmuxAgent instances
+# per tool call.
+_pending_tasks: dict[str, dict] = {}
+
 # tmux is not available on native Windows; requires MSYS2 / WSL or macOS/Linux
 if sys.platform == "win32":
     import os as _os
@@ -442,12 +448,21 @@ class TmuxAgent:
         duration = round(time.time() - start, 2)
 
         if not marker_found:
-            # Timeout - return current screen content with hint
+            # Timeout - save pending task info for wait_for_command to resume
+            _pending_tasks[uid] = {
+                "marker": marker,
+                "marker_pattern": marker_pattern,
+                "out_file": out_file,
+                "rc_file": rc_file,
+                "target": self.target,
+                "start_time": start,
+            }
             output = self.capture_pane()
             result = {
                 "stdout": output,
                 "exit_code": -1,
                 "timed_out": True,
+                "task_id": uid,
                 "duration_seconds": duration,
             }
             return self._format_result(result)
@@ -545,10 +560,17 @@ class TmuxAgent:
         exit_code = result.get("exit_code", -1)
         duration = result.get("duration_seconds", 0)
         timed_out = result.get("timed_out", False)
+        task_id = result.get("task_id")
 
         if timed_out:
             status_parts.append(f"⏱️ [TIMEOUT after {duration:.0f}s] Command may still be running.")
-            status_parts.append("Use tmux_capture_pane to check progress, or tmux_send_ctrl_c to interrupt.")
+            if task_id:
+                status_parts.append(
+                    f"Use tmux_wait_for_command(task_id='{task_id}') to continue waiting for completion."
+                )
+                status_parts.append("Use tmux_capture_pane to check live output, or tmux_send_ctrl_c to interrupt.")
+            else:
+                status_parts.append("Use tmux_capture_pane to check progress, or tmux_send_ctrl_c to interrupt.")
         elif exit_code != 0 and exit_code != -1:
             status_parts.append(f"⚠️ [Exit code: {exit_code}]")
 
@@ -556,14 +578,111 @@ class TmuxAgent:
             parts.append("\n" + "\n".join(status_parts))
 
         # JSON metadata (for programmatic parsing)
-        meta = json.dumps({
+        meta_dict = {
             "exit_code": exit_code,
             "timed_out": timed_out,
             "duration_seconds": duration,
-        }, ensure_ascii=False)
+        }
+        if task_id:
+            meta_dict["task_id"] = task_id
+        meta = json.dumps(meta_dict, ensure_ascii=False)
         parts.append(f"\n📊 [meta: {meta}]")
 
         return "\n".join(parts)
+
+    # ----------------------------------------------------------------
+    # Wait for pending command completion
+    # ----------------------------------------------------------------
+
+    def wait_for_command(self, task_id: str, max_wait: Optional[float] = None) -> str:
+        """Wait for a previously timed-out command to complete.
+
+        When tmux_run_command times out, it saves the task's marker info and
+        returns a task_id. This method resumes waiting for that same marker
+        without re-sending the command.
+
+        Args:
+            task_id: the task_id returned by a timed-out tmux_run_command.
+            max_wait: max seconds to wait. Defaults to self.max_wait.
+
+        Returns:
+            Formatted result string (same format as run_command).
+        """
+        timeout = max_wait or self.max_wait
+
+        task = _pending_tasks.get(task_id)
+        if not task:
+            return (
+                f"❌ Unknown task_id '{task_id}'. "
+                f"It may have already completed, been cleaned up, or the server was restarted.\n"
+                f"Use tmux_capture_pane to check the current pane content."
+            )
+
+        marker = task["marker"]
+        marker_pattern = task["marker_pattern"]
+        out_file = task["out_file"]
+        rc_file = task["rc_file"]
+        original_start = task["start_time"]
+
+        # Poll for marker (same adaptive logic as _run_with_marker)
+        start = time.time()
+        interval = self.poll_interval
+        time.sleep(0.2)
+
+        marker_found = False
+        while (time.time() - start) < timeout:
+            screen = self.capture_pane()
+            if marker_pattern.search(screen):
+                marker_found = True
+                break
+
+            elapsed = time.time() - start
+            if elapsed < 5:
+                interval = self.poll_interval
+            elif elapsed < 30:
+                interval = min(1.0, self.poll_interval + elapsed * 0.02)
+            else:
+                interval = min(2.0, 1.0 + (elapsed - 30) * 0.01)
+            time.sleep(interval)
+
+        # Total duration since the original command was sent
+        total_duration = round(time.time() - original_start, 2)
+
+        if not marker_found:
+            # Still not done — keep task pending for another wait_for_command call
+            output = self.capture_pane()
+            result = {
+                "stdout": output,
+                "exit_code": -1,
+                "timed_out": True,
+                "task_id": task_id,
+                "duration_seconds": total_duration,
+            }
+            return self._format_result(result)
+
+        # Command completed — collect results and clean up
+        del _pending_tasks[task_id]
+
+        time.sleep(0.1)  # ensure file write is complete
+
+        exit_code = self._read_remote_file(rc_file, marker)
+        stdout = self._read_remote_file_content(out_file)
+
+        self.send_keys(f"rm -f {out_file} {rc_file}", press_enter=True)
+        time.sleep(0.1)
+
+        result = {
+            "stdout": stdout,
+            "exit_code": exit_code,
+            "timed_out": False,
+            "duration_seconds": total_duration,
+        }
+        return self._format_result(result)
+
+    @staticmethod
+    def get_pending_task(task_id: str) -> Optional[dict]:
+        """Check if a pending task exists (for external callers)."""
+        return _pending_tasks.get(task_id)
 
     # ----------------------------------------------------------------
     # Session / Window / Pane management
