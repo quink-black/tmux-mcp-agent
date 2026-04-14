@@ -23,6 +23,7 @@ from typing import Any
 # file descriptors and deadlock during their cygwin compatibility layer init.
 # To prevent this, all subprocess.run() calls must use stdin=subprocess.DEVNULL.
 _SUBPROCESS_STDIN = subprocess.DEVNULL if sys.platform == "win32" else None
+_SUBPROCESS_ENCODING = "utf-8" if sys.platform == "win32" else None
 
 # tmux is not available on native Windows (non-MSYS2/Cygwin/WSL)
 if sys.platform == "win32":
@@ -52,7 +53,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-from tmux_agent import TmuxAgent
+from tmux_agent import TmuxAgent, _tmux_fmt, _tmux_unfmt
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tmux-mcp-server")
@@ -1119,6 +1120,7 @@ async def _discover_servers(session_filter: str | None = None, single_target: st
             result = subprocess.run(
                 ["tmux", "list-sessions", "-F", "#{session_name}"],
                 capture_output=True, text=True, stdin=_SUBPROCESS_STDIN,
+                encoding=_SUBPROCESS_ENCODING, errors="replace",
             )
             if result.returncode != 0:
                 return f"Error listing sessions: {result.stderr.strip()}"
@@ -1129,16 +1131,18 @@ async def _discover_servers(session_filter: str | None = None, single_target: st
 
         targets_to_scan = []
         for session in sessions:
+            fmt = _tmux_fmt(f"{session}:" + "#{window_index}.#{pane_index}")
             result = subprocess.run(
                 [
                     "tmux", "list-panes", "-s", "-t", session,
-                    "-F", f"{session}:" + "#{window_index}.#{pane_index}",
+                    "-F", fmt,
                 ],
                 capture_output=True, text=True, stdin=_SUBPROCESS_STDIN,
+                encoding=_SUBPROCESS_ENCODING, errors="replace",
             )
             if result.returncode == 0:
                 targets_to_scan.extend(
-                    [p.strip() for p in result.stdout.strip().split("\n") if p.strip()]
+                    [_tmux_unfmt(p.strip()) for p in result.stdout.strip().split("\n") if p.strip()]
                 )
 
     for target in targets_to_scan:
