@@ -39,6 +39,14 @@ if sys.platform == "win32":
         )
 
 
+# On Windows, when this process is launched with piped stdin/stdout (e.g. as an
+# MCP server), MSYS2/Cygwin child processes (like tmux.exe) may inherit the pipe
+# file descriptors and deadlock during their cygwin compatibility layer init.
+# To prevent this, all subprocess.run() calls that invoke tmux must use
+# stdin=subprocess.DEVNULL so tmux doesn't inherit the parent's stdin pipe.
+_SUBPROCESS_STDIN = subprocess.DEVNULL if sys.platform == "win32" else None
+
+
 class TmuxAgent:
     """Control a tmux session programmatically for AI agent automation."""
 
@@ -99,7 +107,7 @@ class TmuxAgent:
         """List all tmux sessions."""
         result = subprocess.run(
             ["tmux", "list-sessions"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, stdin=_SUBPROCESS_STDIN,
         )
         if result.returncode != 0:
             return f"Error: {result.stderr.strip()}"
@@ -109,7 +117,7 @@ class TmuxAgent:
         """Check if the configured tmux session exists."""
         result = subprocess.run(
             ["tmux", "has-session", "-t", self.session],
-            capture_output=True, text=True,
+            capture_output=True, text=True, stdin=_SUBPROCESS_STDIN,
         )
         return result.returncode == 0
 
@@ -124,7 +132,7 @@ class TmuxAgent:
             ["tmux", "list-panes", "-s", "-t", target_session, "-F",
              "#{window_index}.#{pane_index}|#{pane_title}|#{pane_current_command}|"
              "#{pane_width}x#{pane_height}|#{pane_pid}|#{pane_tty}|#{pane_active}"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, stdin=_SUBPROCESS_STDIN,
         )
         if result.returncode != 0:
             return f"Error: {result.stderr.strip()}"
@@ -140,7 +148,7 @@ class TmuxAgent:
         # Get all sessions first
         result = subprocess.run(
             ["tmux", "list-sessions", "-F", "#{session_name}"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, stdin=_SUBPROCESS_STDIN,
         )
         if result.returncode != 0:
             return f"Error: {result.stderr.strip()}"
@@ -154,7 +162,7 @@ class TmuxAgent:
                  f"{session}:" + "#{window_index}.#{pane_index}|#{pane_title}|"
                  "#{pane_current_command}|#{pane_width}x#{pane_height}|"
                  "#{pane_pid}|#{pane_tty}|#{pane_active}"],
-                capture_output=True, text=True,
+                capture_output=True, text=True, stdin=_SUBPROCESS_STDIN,
             )
             if res.returncode == 0 and res.stdout.strip():
                 all_lines.append(res.stdout.strip())
@@ -177,7 +185,7 @@ class TmuxAgent:
         # Use select-pane -T to set pane title
         result = subprocess.run(
             ["tmux", "select-pane", "-t", target, "-T", title],
-            capture_output=True, text=True,
+            capture_output=True, text=True, stdin=_SUBPROCESS_STDIN,
         )
         if result.returncode != 0:
             return f"Error setting pane title: {result.stderr.strip()}"
@@ -201,14 +209,14 @@ class TmuxAgent:
         cmd = ["tmux", "send-keys", "-t", self.target, keys]
         if press_enter:
             cmd.append("C-m")
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, stdin=_SUBPROCESS_STDIN)
         return result.returncode == 0
 
     def send_ctrl_c(self) -> bool:
         """Send Ctrl+C to interrupt the current process."""
         result = subprocess.run(
             ["tmux", "send-keys", "-t", self.target, "C-c"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, stdin=_SUBPROCESS_STDIN,
         )
         return result.returncode == 0
 
@@ -216,7 +224,7 @@ class TmuxAgent:
         """Send Ctrl+D (EOF)."""
         result = subprocess.run(
             ["tmux", "send-keys", "-t", self.target, "C-d"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, stdin=_SUBPROCESS_STDIN,
         )
         return result.returncode == 0
 
@@ -235,7 +243,7 @@ class TmuxAgent:
         cmd = ["tmux", "capture-pane", "-t", self.target, "-p", "-S", f"-{n}"]
         if colors:
             cmd.insert(3, "-e")  # insert -e flag before -t
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, stdin=_SUBPROCESS_STDIN)
         if result.returncode != 0:
             return f"Error: {result.stderr.strip()}"
         return result.stdout
@@ -500,7 +508,7 @@ class TmuxAgent:
         """
         result = subprocess.run(
             ["tmux", "new-session", "-d", "-s", name],
-            capture_output=True, text=True,
+            capture_output=True, text=True, stdin=_SUBPROCESS_STDIN,
         )
         if result.returncode != 0:
             return f"Error creating session: {result.stderr.strip()}"
@@ -517,7 +525,7 @@ class TmuxAgent:
         """
         result = subprocess.run(
             ["tmux", "new-window", "-t", self.session, "-n", name],
-            capture_output=True, text=True,
+            capture_output=True, text=True, stdin=_SUBPROCESS_STDIN,
         )
         if result.returncode != 0:
             return f"Error creating window: {result.stderr.strip()}"
@@ -542,7 +550,7 @@ class TmuxAgent:
         if size is not None and 0 < size < 100:
             cmd.extend(["-p", str(size)])
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, stdin=_SUBPROCESS_STDIN)
         if result.returncode != 0:
             return f"Error splitting pane: {result.stderr.strip()}"
 
@@ -550,7 +558,7 @@ class TmuxAgent:
         list_result = subprocess.run(
             ["tmux", "list-panes", "-t", self.session, "-F",
              "#{window_index}.#{pane_index}: #{pane_width}x#{pane_height} #{pane_current_command}"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, stdin=_SUBPROCESS_STDIN,
         )
         panes = list_result.stdout.strip() if list_result.returncode == 0 else ""
         return f"Pane split successfully ({direction}).\nCurrent panes:\n{panes}"
@@ -567,7 +575,7 @@ class TmuxAgent:
         target = session_name or self.session
         result = subprocess.run(
             ["tmux", "kill-session", "-t", target],
-            capture_output=True, text=True,
+            capture_output=True, text=True, stdin=_SUBPROCESS_STDIN,
         )
         if result.returncode != 0:
             return f"Error killing session: {result.stderr.strip()}"
@@ -585,7 +593,7 @@ class TmuxAgent:
         target = window_target or self.target
         result = subprocess.run(
             ["tmux", "kill-window", "-t", target],
-            capture_output=True, text=True,
+            capture_output=True, text=True, stdin=_SUBPROCESS_STDIN,
         )
         if result.returncode != 0:
             return f"Error killing window: {result.stderr.strip()}"
@@ -603,7 +611,7 @@ class TmuxAgent:
         target = pane_target or self.target
         result = subprocess.run(
             ["tmux", "kill-pane", "-t", target],
-            capture_output=True, text=True,
+            capture_output=True, text=True, stdin=_SUBPROCESS_STDIN,
         )
         if result.returncode != 0:
             return f"Error killing pane: {result.stderr.strip()}"
@@ -731,7 +739,8 @@ class TmuxAgent:
         # Get local hostname for comparison
         try:
             local_result = subprocess.run(
-                ["hostname"], capture_output=True, text=True, timeout=3
+                ["hostname"], capture_output=True, text=True, timeout=3,
+                stdin=_SUBPROCESS_STDIN,
             )
             result["local_hostname"] = local_result.stdout.strip()
         except Exception:

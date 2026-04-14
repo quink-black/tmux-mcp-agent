@@ -18,6 +18,12 @@ import subprocess
 import sys
 from typing import Any
 
+# On Windows, when this process is launched with piped stdin/stdout (e.g. as an
+# MCP server), MSYS2/Cygwin child processes (like tmux.exe) may inherit the pipe
+# file descriptors and deadlock during their cygwin compatibility layer init.
+# To prevent this, all subprocess.run() calls must use stdin=subprocess.DEVNULL.
+_SUBPROCESS_STDIN = subprocess.DEVNULL if sys.platform == "win32" else None
+
 # tmux is not available on native Windows (non-MSYS2/Cygwin/WSL)
 if sys.platform == "win32":
     import os
@@ -1112,7 +1118,7 @@ async def _discover_servers(session_filter: str | None = None, single_target: st
         else:
             result = subprocess.run(
                 ["tmux", "list-sessions", "-F", "#{session_name}"],
-                capture_output=True, text=True,
+                capture_output=True, text=True, stdin=_SUBPROCESS_STDIN,
             )
             if result.returncode != 0:
                 return f"Error listing sessions: {result.stderr.strip()}"
@@ -1128,7 +1134,7 @@ async def _discover_servers(session_filter: str | None = None, single_target: st
                     "tmux", "list-panes", "-s", "-t", session,
                     "-F", f"{session}:" + "#{window_index}.#{pane_index}",
                 ],
-                capture_output=True, text=True,
+                capture_output=True, text=True, stdin=_SUBPROCESS_STDIN,
             )
             if result.returncode == 0:
                 targets_to_scan.extend(
